@@ -5,91 +5,95 @@ from pydantic import BaseModel
 from typing import TypedDict
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_ollama import ChatOllama
 from database_utils import get_schema, run_query
 
 load_dotenv()
 app = FastAPI()
 
-# 1. State now includes user_role and user_id for security context
+# --- 1. THE MEMORY BANK (Fix for shared history) ---
+# This dictionary will hold separate chat histories for every unique user_id
+# Format: { 1: [{"role": "user", "content": "hi"}, ...], 2: [...] }
+user_memory_bank = {}
+
+# --- 2. STATE & LLM ---
 class AgentState(TypedDict):
     question: str
     user_role: str
     user_id: int
-    history: list
+    history_text: str  # <--- We now pass the user's specific history here
     sql_query: str
     db_results: dict
     error: str
     final_answer: str
 
+
 # for google gemini use this command
 # GOOGLE GEMINI KULLANMAK İÇİN BU KOMUTUN YORUM SATIRINI KALDIRIP BUNU KULLANIN
 #llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.getenv("GOOGLE_API_KEY"))
 
-# for local ai use this command
-# LOCAL AI İÇİN BUNU KULLANIN
-llm = ChatOllama(
-    model="phi3",
-    temperature=0.0 # Setting temperature to 0 makes it strictly logical for writing SQL!
-)
+# Initializing your local Phi-3 model! Temperature 0.0 keeps it strictly logical.
+llm = ChatOllama(model="phi3", temperature=0.0)
 
-# --- NODE 1: SQL Writer (Role-Aware) ---
+
+# --- NODE 1: SQL Writer (Role-Aware & Regex Enhanced) ---
 def sql_writer(state: AgentState):
     schema = get_schema()
     role = state['user_role']
     user_id = state['user_id']
     
-    # Give the AI strict rules based on the user's role
     role_rules = ""
     if role == "INDIVIDUAL":
-        role_rules = f"CRITICAL: The user is an INDIVIDUAL customer (ID: {user_id}). They can ONLY query products. They CANNOT see other users' orders or system stats."
+        role_rules = f"CRITICAL: User is an INDIVIDUAL (ID: {user_id}). They can ONLY query products. NO access to users or stores."
     elif role == "CORPORATE":
-        role_rules = f"CRITICAL: The user is a CORPORATE seller (ID: {user_id}). They can ONLY query their own store's products and orders. Make sure to filter by store_id."
-    elif role == "ADMIN":
-        role_rules = "The user is an ADMIN. They have full read access to all metrics."
-        
-    # Format the history into a readable string for the AI
-    history_text = "Previous Conversation:\n"
-    for msg in state.get('history', []):
-        history_text += f"{msg.get('role', 'unknown').upper()}: {msg.get('content', '')}\n"
+        role_rules = f"CRITICAL: User is a CORPORATE seller (ID: {user_id}). Filter queries by store_id."
 
     prompt = f"""
     You are a Data Analyst AI.
     
-    {history_text}
+    Previous Conversation Context:
+    {state['history_text']}
     
-    Current User Question: '{state['question']}'
+    Write a MySQL query for this new question: '{state['question']}'
     
     {role_rules}
-    
     Schema: {schema}
-    Return ONLY raw SQL code. Must be a SELECT statement.
+    
+    Return ONLY a valid SELECT statement ending with a semicolon (;). Do not explain anything.
     """
         
     response = llm.invoke(prompt)
-    clean_sql = response.content.replace("```sql", "").replace("```", "").strip()
+    raw_text = response.content
+    
+    # --- REGEX SNIPER: The fix for Phi-3 being too chatty ---
+    # This hunts specifically for "SELECT ... ;" and ignores all conversational junk
+    sql_match = re.search(r"(SELECT.*?;)", raw_text, re.IGNORECASE | re.DOTALL)
+    
+    if sql_match:
+        clean_sql = sql_match.group(1).strip()
+    else:
+        # Fallback if it forgot the semicolon
+        clean_sql = raw_text.replace("```sql", "").replace("```", "").strip()
+        
     return {"sql_query": clean_sql, "error": None}
 
-# --- NODE 2: THE SECURITY GUARDRAIL ---
+
+# --- NODE 2: Security Checker ---
 def security_checker(state: AgentState):
     sql = state['sql_query'].lower()
     
-    # 1. Block malicious SQL commands
-    forbidden_words = ["drop", "delete", "update", "insert", "alter", "truncate", "grant", "revoke"]
+    forbidden_words = ["drop", "delete", "update", "insert", "alter", "truncate"]
     if any(word in sql for word in forbidden_words):
-        return {"error": "SECURITY VIOLATION: AI attempted to modify the database.", "sql_query": ""}
+        return {"error": "SECURITY VIOLATION: Database modification blocked.", "sql_query": ""}
     
-    # 2. Block Individuals from seeing sensitive tables
-    if state['user_role'] == "INDIVIDUAL":
-        if "users" in sql or "stores" in sql:
-             return {"error": "SECURITY VIOLATION: Individual users cannot access system tables.", "sql_query": ""}
+    if state['user_role'] == "INDIVIDUAL" and ("users" in sql or "stores" in sql):
+        return {"error": "SECURITY VIOLATION: Permission denied for system tables.", "sql_query": ""}
 
-    return {"error": None} # Passed security checks!
+    return {"error": None}
+
 
 # --- NODE 3: Database Executor ---
 def db_executor(state: AgentState):
-    # If the security checker flagged an error, DO NOT run the query!
     if state.get("error"):
         return {"db_results": None}
         
@@ -98,30 +102,38 @@ def db_executor(state: AgentState):
         return {"error": result['error'], "db_results": None}
     return {"db_results": result, "error": None}
 
+
 # --- NODE 4: Summarizer ---
 def summarizer(state: AgentState):
     if state.get("error") and "SECURITY VIOLATION" in state["error"]:
-        return {"final_answer": "I'm sorry, but you do not have permission to access that information."}
+        return {"final_answer": "I'm sorry, you do not have permission to view this data."}
         
-    prompt = f"User Question: {state['question']}\nData: {state['db_results']}\nWrite a helpful, professional response answering the user."
+    prompt = f"""
+    User Question: {state['question']}
+    Data Results: {state['db_results']}
+    
+    Write a short, natural response answering the user's question based strictly on the data provided. Do not show the SQL query.
+    """
     response = llm.invoke(prompt)
     return {"final_answer": response.content}
+
 
 # --- EDGE ROUTING ---
 def route_after_security(state: AgentState):
     if state.get("error"):
-        return "summarizer" # If security violation, go straight to the end and say "No permission"
+        return "summarizer" 
     return "db_executor"
 
 def route_after_execution(state: AgentState):
     if state.get("error"):
-        return "sql_writer" # If it's just a syntax error, try writing it again
+        return "sql_writer" 
     return "summarizer"
 
-# --- Build Graph ---
+
+# --- BUILD GRAPH ---
 workflow = StateGraph(AgentState)
 workflow.add_node("sql_writer", sql_writer)
-workflow.add_node("security_checker", security_checker) # Add the new node!
+workflow.add_node("security_checker", security_checker)
 workflow.add_node("db_executor", db_executor)
 workflow.add_node("summarizer", summarizer)
 
@@ -133,27 +145,50 @@ workflow.add_edge("summarizer", END)
 
 ai_brain = workflow.compile()
 
-# --- FASTAPI ENDPOINT ---
+
+# --- FASTAPI ENDPOINT & MEMORY MANAGEMENT ---
 class ChatRequest(BaseModel):
     message: str
     user_role: str
     user_id: int
-    history: list = []
 
 @app.post("/agent/ask")
 async def ask_agent(request: ChatRequest):
     try:
+        user_id = request.user_id
+        
+        # 1. Retrieve THIS specific user's history
+        if user_id not in user_memory_bank:
+            user_memory_bank[user_id] = []
+            
+        user_history = user_memory_bank[user_id]
+        
+        # Format it into a readable string for Phi-3
+        history_str = "\n".join([f"{msg['role'].upper()}: {msg['content']}" for msg in user_history])
+        
+        # 2. Run the LangGraph
         inputs = {
             "question": request.message, 
             "user_role": request.user_role,
-            "user_id": request.user_id,
-            "history": request.history
+            "user_id": user_id,
+            "history_text": history_str
         }
+        
         for output in ai_brain.stream(inputs):
             pass 
         
         final_answer = output.get('summarizer', {}).get('final_answer', "Sorry, an error occurred.")
+        
+        # 3. Save the new interaction back to THIS user's memory
+        user_memory_bank[user_id].append({"role": "user", "content": request.message})
+        user_memory_bank[user_id].append({"role": "ai", "content": final_answer})
+        
+        # Optional: Keep memory short (last 6 messages) so Phi-3 doesn't get confused
+        if len(user_memory_bank[user_id]) > 6:
+            user_memory_bank[user_id] = user_memory_bank[user_id][-6:]
+            
         return {"reply": final_answer}
+        
     except Exception as e:
         print(f"❌ ERROR CRASH: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
