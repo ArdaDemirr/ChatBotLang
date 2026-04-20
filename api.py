@@ -6,6 +6,7 @@ from typing import TypedDict
 from dotenv import load_dotenv
 from langgraph.graph import StateGraph, END
 from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_ollama import ChatOllama
 from database_utils import get_schema, run_query
 
 load_dotenv()
@@ -16,12 +17,22 @@ class AgentState(TypedDict):
     question: str
     user_role: str
     user_id: int
+    history: list
     sql_query: str
     db_results: dict
     error: str
     final_answer: str
 
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.getenv("GOOGLE_API_KEY"))
+# for google gemini use this command
+# GOOGLE GEMINI KULLANMAK İÇİN BU KOMUTUN YORUM SATIRINI KALDIRIP BUNU KULLANIN
+#llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.getenv("GOOGLE_API_KEY"))
+
+# for local ai use this command
+# LOCAL AI İÇİN BUNU KULLANIN
+llm = ChatOllama(
+    model="phi3",
+    temperature=0.0 # Setting temperature to 0 makes it strictly logical for writing SQL!
+)
 
 # --- NODE 1: SQL Writer (Role-Aware) ---
 def sql_writer(state: AgentState):
@@ -37,9 +48,18 @@ def sql_writer(state: AgentState):
         role_rules = f"CRITICAL: The user is a CORPORATE seller (ID: {user_id}). They can ONLY query their own store's products and orders. Make sure to filter by store_id."
     elif role == "ADMIN":
         role_rules = "The user is an ADMIN. They have full read access to all metrics."
+        
+    # Format the history into a readable string for the AI
+    history_text = "Previous Conversation:\n"
+    for msg in state.get('history', []):
+        history_text += f"{msg.get('role', 'unknown').upper()}: {msg.get('content', '')}\n"
 
     prompt = f"""
-    You are a Data Analyst AI. Write a MySQL query for this question: '{state['question']}'
+    You are a Data Analyst AI.
+    
+    {history_text}
+    
+    Current User Question: '{state['question']}'
     
     {role_rules}
     
@@ -118,6 +138,7 @@ class ChatRequest(BaseModel):
     message: str
     user_role: str
     user_id: int
+    history: list = []
 
 @app.post("/agent/ask")
 async def ask_agent(request: ChatRequest):
@@ -125,7 +146,8 @@ async def ask_agent(request: ChatRequest):
         inputs = {
             "question": request.message, 
             "user_role": request.user_role,
-            "user_id": request.user_id
+            "user_id": request.user_id,
+            "history": request.history
         }
         for output in ai_brain.stream(inputs):
             pass 
