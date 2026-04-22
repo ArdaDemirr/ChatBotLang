@@ -134,32 +134,29 @@ def sql_writer(state: AgentState):
 
     if role == "GUEST":
         role_context = (
-            "This is a guest (non-logged-in) user. "
-            "Only answer questions about general public data: products, categories, prices, and bestsellers. "
-            "Do NOT filter by user_id or include personal/order data."
+            "You are talking to a GUEST (not logged in). "
+            "They can ONLY ask about public products and categories. "
+            "If they ask for orders, users, shipments, or payments, YOU MUST RETURN: UNAUTHORIZED_GUEST"
         )
     elif role == "INDIVIDUAL":
         role_context = (
-            f"The current user is a CUSTOMER with user_id = {user_id}. "
-            f"Always filter results to only show this user's data "
-            f"(use user_id or customer_id = {user_id} where applicable)."
+            f"You are talking to a CUSTOMER with user_id = {user_id}. "
+            f"They can ONLY ask about their own orders, reviews, or shipments. "
+            f"If they explicitly mention another user's name, email, or ID, YOU MUST RETURN: UNAUTHORIZED_USER\n"
+            f"If they ask for global stats or admin data, YOU MUST RETURN: UNAUTHORIZED_ADMIN\n"
+            f"If the request is allowed, you MUST filter by user_id = {user_id}."
         )
     elif role == "ADMIN":
         role_context = (
-            "This user is a PLATFORM ADMINISTRATOR. "
-            "They have FULL unrestricted access to ALL tables and ALL data. "
-            "Do NOT add any user_id or store_id filters unless explicitly asked. "
-            "They can see: all orders, all users, all products, all reviews, all stores, all shipments. "
-            "For analytics questions like 'last 5 orders', 'best selling product', 'total revenue', "
-            "write aggregate queries with ORDER BY, COUNT, SUM, GROUP BY as needed. "
-            "Never restrict data access for ADMIN users."
+            "You are talking to an ADMIN. They have full access to everything. "
+            "No restrictions. Do not force any filters unless asked."
         )
-    else:
+    else: # CORPORATE
         role_context = (
-            f"The current user is a STORE OWNER with user_id = {user_id}. "
-            f"Filter results to their store's data using seller_id or store_id. "
-            f"For aggregate queries like 'best selling product', "
-            f"join orders with products and group/order correctly."
+            f"You are talking to a STORE OWNER with user_id = {user_id}. "
+            f"If they ask for another store's private data, YOU MUST RETURN: UNAUTHORIZED_STORE\n"
+            f"If they ask for global users or admin data, YOU MUST RETURN: UNAUTHORIZED_ADMIN\n"
+            f"If allowed, you MUST filter by store_id or seller_id."
         )
 
     history_block = (
@@ -167,45 +164,53 @@ def sql_writer(state: AgentState):
         if state.get("history_text") else ""
     )
 
-    # SELF-CORRECTION PROMPT: If the DB returned an error, scold the AI and tell it to fix it
     if error and state.get("sql_query") and state["sql_query"] != "NONE":
         prompt = f"""You are a MySQL query generator.
 Schema:
 {schema}
 
-Context: {role_context}
+Access Rules:
+{role_context}
+
 Question: {state["question"]}
 
 WARNING! Your previous query failed with this error:
 {error}
-
 Previous Bad Query:
 {state["sql_query"]}
 
 Instructions:
-- Fix the SQL query so it works with the provided schema.
-- NEVER use columns that do not exist in the schema.
-- Return ONLY the raw SQL. No markdown, no explanation.
+1. FIRST, check the Access Rules. If the question is forbidden, return ONLY the exact UNAUTHORIZED string. DO NOT write SQL.
+2. If permitted, fix the SQL so it works with the schema.
+3. Return ONLY the raw SQL or the UNAUTHORIZED string. No markdown, no explanation.
 """
-    # NORMAL PROMPT: First time writing the query
     else:
         prompt = f"""You are a MySQL query generator for an e-commerce database.
 
 Schema:
 {schema}
 
-{history_block}Context: {role_context}
+{history_block}Access Rules:
+{role_context}
+
 Question: {state["question"]}
 
 Instructions:
-- Write ONE valid MySQL SELECT statement.
-- Do NOT use DROP, DELETE, UPDATE, INSERT, ALTER, or TRUNCATE.
-- Return ONLY the raw SQL. No markdown, no backticks, no explanation.
+1. CRITICAL: First, evaluate the Access Rules. If the user's question violates their permissions (like asking for another user's data), you MUST NOT write SQL. Instead, return ONLY the exact UNAUTHORIZED string mentioned in the rules.
+2. If the request is permitted, write ONE valid MySQL SELECT statement.
+3. Return ONLY the raw SQL (or the UNAUTHORIZED string). No markdown, no backticks, no explanation.
 """
 
     raw = llm_invoke(prompt)
     print(f"\n[SQL_WRITER] Q: {state['question']}")
-    print(f"[SQL_WRITER] Raw:\n{raw}")
+    print(f"\n[SQL_WRITER] Raw:\n{raw}")
+
+    # --- INTERCEPT REFUSALS BEFORE REGEX ---
+    raw_upper = raw.upper()
+    if "UNAUTHORIZED_USER" in raw_upper: return {"sql_query": "NONE", "error": "SECURITY_USER"}
+    if "UNAUTHORIZED_STORE" in raw_upper: return {"sql_query": "NONE", "error": "SECURITY_STORE"}
+    if "UNAUTHORIZED_ADMIN" in raw_upper: return {"sql_query": "NONE", "error": "SECURITY_ADMIN"}
+    if "UNAUTHORIZED_GUEST" in raw_upper: return {"sql_query": "NONE", "error": "SECURITY_GUEST"}
 
     # Safe regex fix
     raw = raw.replace("```sql", "").replace("```mysql", "").replace("```", "").strip()
@@ -220,28 +225,55 @@ Instructions:
         sql += ";"
         
     print(f"[SQL_WRITER] SQL: {sql}\n")
-    
-    # Crucial: Reset the error to None so the loop knows it was "fixed"
     return {"sql_query": sql, "error": None}
 
 def security_checker(state: AgentState) -> dict:
+    # If the SQL Writer already flagged an unauthorized prompt, preserve the error and skip checks
+    if state.get("error") and "SECURITY" in state["error"]:
+        return {"error": state["error"], "sql_query": "NONE"}
+
     sql = state.get("sql_query", "").lower()
     if sql == "none" or not sql:
         return {}
 
-    forbidden = ["drop", "delete", "update", "insert", "alter", "truncate"]
+    # 1. Block destructive commands
+    forbidden = ["drop", "delete", "update", "insert", "alter", "truncate", "grant"]
     if any(word in sql for word in forbidden):
-        return {"error": "SECURITY: Database modification blocked.", "sql_query": "NONE"}
+        return {"error": "SECURITY_ADMIN", "sql_query": "NONE"}
 
-    # GUEST users can only query public tables (products, categories)
-    guest_blocked_tables = ["orders", "users", "shipments", "order_items", "payments", "stores"]
-    if state["user_role"] == "GUEST" and any(t in sql for t in guest_blocked_tables):
-        return {"error": "SECURITY: Guest access to personal data denied.", "sql_query": "NONE"}
+    role = state["user_role"]
+    uid = str(state["user_id"])
 
-    # INDIVIDUAL users cannot access system-level tables
-    if state["user_role"] == "INDIVIDUAL" and any(t in sql for t in ["users", "stores"]):
-        return {"error": "SECURITY: Access to system tables denied.", "sql_query": "NONE"}
+    # 2. GUEST Restrictions
+    if role == "GUEST":
+        guest_blocked_tables = ["orders", "users", "shipments", "order_items", "payments", "stores"]
+        if any(t in sql for t in guest_blocked_tables):
+            return {"error": "SECURITY_GUEST", "sql_query": "NONE"}
 
+    # 3. INDIVIDUAL Restrictions (Strict IDOR Regex Prevention)
+    if role == "INDIVIDUAL":
+        # Block system tables completely
+        if any(t in sql for t in ["users", "stores"]):
+            return {"error": "SECURITY_ADMIN", "sql_query": "NONE"}
+        
+        personal_tables = ["orders", "order_items", "shipments", "reviews", "payments"]
+        if any(t in sql for t in personal_tables):
+            # We use regex word boundaries (\b) so an ID of '5' doesn't accidentally pass just because 'LIMIT 50' is in the query.
+            if not re.search(r'\b' + uid + r'\b', sql):
+                return {"error": "SECURITY_USER", "sql_query": "NONE"}
+
+    # 4. CORPORATE Restrictions
+    if role == "CORPORATE":
+        # Store owners shouldn't see all users
+        if "users" in sql:
+             return {"error": "SECURITY_ADMIN", "sql_query": "NONE"}
+        
+        transaction_tables = ["orders", "order_items", "shipments"]
+        if any(t in sql for t in transaction_tables):
+            if not re.search(r'\b' + uid + r'\b', sql):
+                return {"error": "SECURITY_STORE", "sql_query": "NONE"}
+
+    # Admin passes through with no restrictions
     return {"error": None}
 
 def db_executor(state: AgentState):
@@ -261,12 +293,17 @@ def summarizer(state: AgentState):
     error = state.get("error") or ""
     lang = detect_language(state["question"])
 
+    # --- CUSTOM UI ERROR MESSAGES FOR THE PRESENTATION DEMO ---
+    if "SECURITY_USER" in error:
+        return {"final_answer": "Başka bir kullanıcının verisini görüntüleyemezsiniz." if lang == "tr" else "You cannot view another user's data."}
+    if "SECURITY_STORE" in error:
+        return {"final_answer": "Mağazanın sahibi siz olmadığınız için buna izniniz yok." if lang == "tr" else "You do not have permission as you do not own this store."}
+    if "SECURITY_ADMIN" in error:
+        return {"final_answer": "Yönetici değilsiniz, bu komutu sadece yöneticiler kullanabilir." if lang == "tr" else "You are not an admin. Only administrators can use this command."}
+    if "SECURITY_GUEST" in error:
+        return {"final_answer": "Bu işlemi yapmak için giriş yapmalısınız." if lang == "tr" else "You must log in to view this."}
     if "SECURITY" in error:
-        return {"final_answer": (
-            "Üzgünüm, bu bilgilere erişme yetkiniz bulunmamaktadır."
-            if lang == "tr" else
-            "Sorry, you don't have permission to access this data."
-        )}
+        return {"final_answer": "Üzgünüm, bu bilgilere erişme yetkiniz bulunmamaktadır." if lang == "tr" else "Sorry, you don't have permission to access this data."}
 
     if "SQL generation failed" in error or state.get("sql_query") == "NONE":
         return {"final_answer": (
@@ -333,7 +370,6 @@ def route_after_security(state: AgentState) -> str:
 
 workflow.add_conditional_edges("security", route_after_security)
 
-# --- THE MISSING LOGIC HAS BEEN ADDED HERE ---
 def route_after_db(state: AgentState) -> str:
     """If the DB throws an error, route back to the SQL writer to fix it."""
     if state.get("error"):
@@ -341,10 +377,7 @@ def route_after_db(state: AgentState) -> str:
         return "sql"
     return "sum"
 
-# Replaced the direct edge with the conditional edge
 workflow.add_conditional_edges("db", route_after_db)
-# ---------------------------------------------
-
 workflow.add_edge("sum", END)
 
 ai_brain = workflow.compile()
