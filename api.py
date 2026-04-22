@@ -120,6 +120,7 @@ def sql_writer(state: AgentState):
     elif role == "INDIVIDUAL":
         role_context = (
             f"You are talking to a CUSTOMER with user_id = {user_id}. "
+            f"the products and category of them with reviews made to them are public data can return queries like most expensive one or how many producs are there etc (but do not return their order or shipment values made by other users)"
             f"They can ONLY ask about their own orders, reviews, or shipments. "
             f"If they explicitly mention another user's name, email, or ID, YOU MUST RETURN: UNAUTHORIZED_USER\n"
             f"If they ask for global stats or admin data, YOU MUST RETURN: UNAUTHORIZED_ADMIN\n"
@@ -133,6 +134,7 @@ def sql_writer(state: AgentState):
     else: # CORPORATE
         role_context = (
             f"You are talking to a STORE OWNER with user_id = {user_id}. "
+            f"the products and category of them with reviews made to them are public data can return queries like most expensive one or how many producs are there etc (but do not return their order or shipment values made by other users)"
             f"If they ask for another store's private data, YOU MUST RETURN: UNAUTHORIZED_STORE\n"
             f"If they ask for global users or admin data, YOU MUST RETURN: UNAUTHORIZED_ADMIN\n"
             f"They can ONLY ask about their own stores orders, reviews, or shipments. "
