@@ -28,7 +28,7 @@ user_memory_bank: dict[int, list[dict]] = {}
 
 LLM_CHAIN = [
     # ── 1. Groq (Fastest & Free) ──────────────────────────────────────
-    {"name": "llama-3.1-70b", "model": "llama-3.1-70b-versatile", "provider": "groq"},
+    {"name": "llama-3.3-70b", "model": "llama-3.3-70b-versatile", "provider": "groq"}, # Updated to 3.3
     {"name": "llama-3.1-8b", "model": "llama-3.1-8b-instant", "provider": "groq"},
 
     # ── 2. Google Gemini (Backup Engine) ──────────────────────────────
