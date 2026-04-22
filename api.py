@@ -28,7 +28,7 @@ user_memory_bank: dict[int, list[dict]] = {}
 
 LLM_CHAIN = [
     # ── 1. Groq (Fastest & Free) ──────────────────────────────────────
-    {"name": "llama-3.3-70b", "model": "llama-3.3-70b-versatile", "provider": "groq"}, # Updated to 3.3
+    {"name": "llama-3.3-70b", "model": "llama-3.3-70b-versatile", "provider": "groq"},
     {"name": "llama-3.1-8b", "model": "llama-3.1-8b-instant", "provider": "groq"},
 
     # ── 2. Google Gemini (Backup Engine) ──────────────────────────────
@@ -123,12 +123,14 @@ def intent_classifier(state: AgentState):
     return {"intent": "greeting" if is_greeting(state["question"]) else "db_query"}
 
 def greeting_handler(state: AgentState):
-    return {"final_answer": "Merhaba! Ne öğrenmek istersiniz?"}
+    lang = detect_language(state["question"])
+    return {"final_answer": "Merhaba! Ne öğrenmek istersiniz?" if lang == "tr" else "Hello! What would you like to know?"}
 
 def sql_writer(state: AgentState):
     schema = get_schema()
     role = state["user_role"]
     user_id = state["user_id"]
+    error = state.get("error")
 
     if role == "GUEST":
         role_context = (
@@ -165,7 +167,29 @@ def sql_writer(state: AgentState):
         if state.get("history_text") else ""
     )
 
-    prompt = f"""You are a MySQL query generator for an e-commerce database.
+    # SELF-CORRECTION PROMPT: If the DB returned an error, scold the AI and tell it to fix it
+    if error and state.get("sql_query") and state["sql_query"] != "NONE":
+        prompt = f"""You are a MySQL query generator.
+Schema:
+{schema}
+
+Context: {role_context}
+Question: {state["question"]}
+
+WARNING! Your previous query failed with this error:
+{error}
+
+Previous Bad Query:
+{state["sql_query"]}
+
+Instructions:
+- Fix the SQL query so it works with the provided schema.
+- NEVER use columns that do not exist in the schema.
+- Return ONLY the raw SQL. No markdown, no explanation.
+"""
+    # NORMAL PROMPT: First time writing the query
+    else:
+        prompt = f"""You are a MySQL query generator for an e-commerce database.
 
 Schema:
 {schema}
@@ -183,8 +207,7 @@ Instructions:
     print(f"\n[SQL_WRITER] Q: {state['question']}")
     print(f"[SQL_WRITER] Raw:\n{raw}")
 
-    # --- THE CRITICAL REGEX FIX ---
-    # Replaced the destructive re.sub with safe string replacement
+    # Safe regex fix
     raw = raw.replace("```sql", "").replace("```mysql", "").replace("```", "").strip()
     match = re.search(r"(SELECT\b.*)", raw, re.IGNORECASE | re.DOTALL)
 
@@ -197,6 +220,8 @@ Instructions:
         sql += ";"
         
     print(f"[SQL_WRITER] SQL: {sql}\n")
+    
+    # Crucial: Reset the error to None so the loop knows it was "fixed"
     return {"sql_query": sql, "error": None}
 
 def security_checker(state: AgentState) -> dict:
@@ -209,7 +234,6 @@ def security_checker(state: AgentState) -> dict:
         return {"error": "SECURITY: Database modification blocked.", "sql_query": "NONE"}
 
     # GUEST users can only query public tables (products, categories)
-    # Block any access to personal/transactional tables
     guest_blocked_tables = ["orders", "users", "shipments", "order_items", "payments", "stores"]
     if state["user_role"] == "GUEST" and any(t in sql for t in guest_blocked_tables):
         return {"error": "SECURITY: Guest access to personal data denied.", "sql_query": "NONE"}
@@ -308,7 +332,19 @@ def route_after_security(state: AgentState) -> str:
     return "sum" if state.get("error") else "db"
 
 workflow.add_conditional_edges("security", route_after_security)
-workflow.add_edge("db", "sum")
+
+# --- THE MISSING LOGIC HAS BEEN ADDED HERE ---
+def route_after_db(state: AgentState) -> str:
+    """If the DB throws an error, route back to the SQL writer to fix it."""
+    if state.get("error"):
+        print("\n🔄 [ROUTER] Database error detected, routing back to SQL Writer for correction...\n")
+        return "sql"
+    return "sum"
+
+# Replaced the direct edge with the conditional edge
+workflow.add_conditional_edges("db", route_after_db)
+# ---------------------------------------------
+
 workflow.add_edge("sum", END)
 
 ai_brain = workflow.compile()
@@ -347,8 +383,9 @@ async def ask_agent(request: ChatRequest):
             "final_answer": "",
         }
 
+        # Recursion limit prevents infinite loops if it constantly fails
         result = ai_brain.invoke(state, {"recursion_limit": 15})
-        answer = result.get("final_answer", "Bir hata oluştu.")
+        answer = result.get("final_answer", "An error occurred.")
 
         if result.get("intent") != "greeting":
             user_memory_bank[uid].append({"role": "user", "content": request.message})
