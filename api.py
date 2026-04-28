@@ -31,7 +31,6 @@ LLM_CHAIN = [
     {"name": "llama-3.3-70b", "model": "llama-3.3-70b-versatile", "provider": "groq"},
     {"name": "llama-3.1-8b", "model": "llama-3.1-8b-instant", "provider": "groq"},
     {"name": "gemini-2.5-flash", "model": "gemini-2.5-flash", "provider": "google"},
-    {"name": "phi4-mini", "model": "phi4-mini", "provider": "ollama"},
 ]
 
 _QUOTA_KEYWORDS = ("quota", "rate", "limit", "429", "exhausted")
@@ -121,6 +120,7 @@ def sql_writer(state: AgentState):
         role_context = (
             f"You are talking to a CUSTOMER with user_id = {user_id}. "
             f"the products and category of them with reviews made to them are public data can return queries like most expensive one or how many producs are there etc (but do not return their order or shipment values made by other users)"
+            f"You can answer questions related to stores and their products, do not return personal information about the stores or owners, just the product information of stores, like which stores sell phones, or which store is the best seller like "
             f"They can ONLY ask about their own orders, reviews, or shipments. "
             f"If they explicitly mention another user's name, email, or ID, YOU MUST RETURN: UNAUTHORIZED_USER\n"
             f"If they ask for global stats or admin data, YOU MUST RETURN: UNAUTHORIZED_ADMIN\n"
@@ -135,6 +135,8 @@ def sql_writer(state: AgentState):
         role_context = (
             f"You are talking to a STORE OWNER with user_id = {user_id}. "
             f"the products and category of them with reviews made to them are public data can return queries like most expensive one or how many producs are there etc (but do not return their order or shipment values made by other users)"
+            f"You can answer questions related to stores and their products, do not return personal information about the stores or owners, just the product information of stores, like which stores sell phones, or which store is the best seller like "
+            f"you can return rivaly questions, like who is the rival of us right now, just dont return their personal data, use data to make comparison just return the results"
             f"If they ask for another store's private data, YOU MUST RETURN: UNAUTHORIZED_STORE\n"
             f"If they ask for global users or admin data, YOU MUST RETURN: UNAUTHORIZED_ADMIN\n"
             f"They can ONLY ask about their own stores orders, reviews, or shipments. "
