@@ -119,12 +119,19 @@ def sql_writer(state: AgentState):
     elif role == "INDIVIDUAL":
         role_context = (
             f"You are talking to a CUSTOMER with user_id = {user_id}. "
+            f"PUBLIC DATA: Products, categories, and global statistics (like 'best selling stores', 'most expensive products'). "
             f"the products and category of them with reviews made to them are public data can return queries like most expensive one or how many producs are there etc (but do not return their order or shipment values made by other users)"
+            f"PRIVATE DATA: Their own orders, shipments, and payments. "
             f"You can answer questions related to stores and their products, do not return personal information about the stores or owners, just the product information of stores, like which stores sell phones, or which store is the best seller like "
             f"They can ONLY ask about their own orders, reviews, or shipments. "
             f"If they explicitly mention another user's name, email, or ID, YOU MUST RETURN: UNAUTHORIZED_USER\n"
             f"If they ask for global stats or admin data, YOU MUST RETURN: UNAUTHORIZED_ADMIN\n"
             f"If the request is allowed, you MUST filter by user_id = {user_id}."
+            f"CRITICAL RULES: "
+            f"1. For personal data (my orders), you MUST filter by user_id = {user_id}. "
+            f"2. For global analytics ('best selling store', 'top products'), DO NOT use user_id. Use global GROUP BY, SUM, or COUNT. "
+            f"3. NEVER return other specific users' personal info. Return UNAUTHORIZED_USER. "
+            f"4. If asking for admin data (users list), return UNAUTHORIZED_ADMIN."
         )
     elif role == "ADMIN":
         role_context = (
@@ -141,6 +148,13 @@ def sql_writer(state: AgentState):
             f"If they ask for global users or admin data, YOU MUST RETURN: UNAUTHORIZED_ADMIN\n"
             f"They can ONLY ask about their own stores orders, reviews, or shipments. "
             f"If allowed, you MUST filter by store_id or seller_id."
+            f"PUBLIC DATA: Competitor products, 'best selling stores/products' analytics. "
+            f"PRIVATE DATA: Their own store's orders and shipments. "
+            f"CRITICAL RULES: "
+            f"1. For their own store data, you MUST filter by 'stores.owner_id = {user_id}'. "
+            f"2. For global analytics ('who is my rival', 'best selling store'), DO NOT filter by their store. Compare globally using GROUP BY. "
+            f"3. When finding rivals/competitors, simply exclude their store by adding 'stores.owner_id != {user_id}' to the WHERE clause. DO NOT write complex subqueries joining the users table for this. "
+            f"4. If they explicitly ask for a global list of all users or admin data, YOU MUST RETURN: UNAUTHORIZED_ADMIN."
         )
 
     history_block = (
@@ -229,32 +243,29 @@ def security_checker(state: AgentState) -> dict:
 
     # 2. GUEST Restrictions
     if role == "GUEST":
-        guest_blocked_tables = ["orders", "users", "shipments", "order_items", "payments", "stores"]
+        # DÜZELTME: "stores" kelimesini buradan çıkardık ki misafirler ürünün hangi mağazada olduğunu görebilsin.
+        guest_blocked_tables = ["orders", "users", "shipments", "order_items", "payments"]
         if any(t in sql for t in guest_blocked_tables):
             return {"error": "SECURITY_GUEST", "sql_query": "NONE"}
 
-    # 3. INDIVIDUAL Restrictions (Access to public data + own personal data)
-    if role == "INDIVIDUAL":
-        # Block access to other users or store management tables
-        if any(t in sql for t in ["users", "stores"]):
-            return {"error": "SECURITY_ADMIN", "sql_query": "NONE"}
-        
-        # Mandatory IDOR check for personal tables
-        personal_tables = ["orders", "order_items", "shipments", "reviews", "payments"]
-        if any(t in sql for t in personal_tables):
-            if not re.search(r'\b' + uid + r'\b', sql):
+    # 3. INDIVIDUAL Restrictions 
+    # shipments ve payments kesinlikle kişiseldir
+    if any(t in sql for t in ["shipments", "payments"]):
+        if not re.search(r'\b' + uid + r'\b', sql):
+            return {"error": "SECURITY_USER", "sql_query": "NONE"}
+            
+    # Siparişler (orders) için BESTSELLER İSTİSNASI (SUM, COUNT, GROUP BY kullanılıyorsa anonimdir)
+    if "orders" in sql or "order_items" in sql:
+            is_analytic_query = "group by" in sql and ("sum" in sql or "count" in sql or "limit" in sql)
+            if not is_analytic_query and not re.search(r'\b' + uid + r'\b', sql):
                 return {"error": "SECURITY_USER", "sql_query": "NONE"}
 
-    # 4. CORPORATE Restrictions (Access to own store and products)
+    # 4. CORPORATE Restrictions 
     if role == "CORPORATE":
-        if "users" in sql:
-             return {"error": "SECURITY_ADMIN", "sql_query": "NONE"}
-        
-        # Corporate users can query products (their own) and transactions (their store's)
-        # We ensure their owner/seller ID is linked in the SQL
-        transaction_tables = ["orders", "order_items", "shipments", "products"]
+        transaction_tables = ["orders", "order_items", "shipments"]
         if any(t in sql for t in transaction_tables):
-            if not re.search(r'\b' + uid + r'\b', sql):
+            is_analytic_query = "group by" in sql and ("sum" in sql or "count" in sql or "limit" in sql)
+            if not is_analytic_query and not re.search(r'\b' + uid + r'\b', sql):
                 return {"error": "SECURITY_STORE", "sql_query": "NONE"}
 
     return {"error": None}
