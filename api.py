@@ -1,28 +1,3 @@
-"""
-QueryMind Agent API — api.py
-======================================================
-Security model (what each role can see):
-
-  GUEST       → public products, categories, public reviews, global analytics
-                 (most expensive, best rated, most commented, top stores by
-                  public metrics). NO orders, users, shipments, payments.
-
-  INDIVIDUAL  → everything GUEST can see
-                 PLUS their own orders, shipments, payments, reviews.
-                 CANNOT see any other user's private data.
-
-  CORPORATE   → everything GUEST can see (global analytics, all products)
-                 PLUS their own store's orders, shipments, revenue.
-                 PLUS basic buyer info (name only) for orders from THEIR store.
-                 PLUS rivalry / competitive analytics (other stores' public metrics,
-                  category overlap — but no other store's private financials).
-                 CANNOT see individual user details, admin data, or other stores'
-                  private orders/revenue.
-
-  ADMIN       → full read access to everything.
-                 Destructive DDL (DROP, DELETE, TRUNCATE, etc.) is always blocked.
-"""
-
 import os
 import re
 import time
@@ -345,8 +320,9 @@ Error from MySQL:
 Instructions:
 1. Check access rules first. If the question is forbidden → return ONLY the exact UNAUTHORIZED string.
 2. Fix the SQL error while keeping the same intent.
-3. Return ONLY the raw SQL or the UNAUTHORIZED string. No markdown, no backticks, no explanation.
-4. CRITICAL — ORDER ITEMS RULE: When listing items/products inside an order, NEVER put LIMIT on the outer query. Use LIMIT 1 only in a subquery to pick the order, then return ALL order_items rows for that order.
+3. MYSQL LIMITATION: MySQL does NOT support 'LIMIT' inside 'IN(...)' subqueries. If you need a limit, you MUST use a derived table (e.g., JOIN (SELECT ... LIMIT 5) AS temp) or a WITH clause.
+4. Return ONLY the raw SQL or the UNAUTHORIZED string. No markdown, no explanation.
+5. CRITICAL — ORDER ITEMS RULE: When listing items/products inside an order, NEVER put LIMIT on the outer query. Use LIMIT 1 only in a subquery to pick the order, then return ALL order_items rows for that order.
 """
     else:
         prompt = f"""You are a MySQL query generator for an e-commerce database.
@@ -385,7 +361,7 @@ Instructions:
 
     # Strip markdown fences
     cleaned = re.sub(r"```(?:sql|mysql)?", "", raw, flags=re.IGNORECASE).replace("```", "").strip()
-    match = re.search(r"(SELECT\b.*)", cleaned, re.IGNORECASE | re.DOTALL)
+    match = re.search(r"((?:WITH|SELECT)\b.*)", cleaned, re.IGNORECASE | re.DOTALL)
 
     if not match:
         print("[SQL_WRITER] No SELECT found.")
